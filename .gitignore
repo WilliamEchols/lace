@@ -1,0 +1,10 @@
+# Emacs backup files
+*~
+\#*\#
+.\#*
+
+# Compiled files
+*.elc
+
+# Package files
+*.tar
