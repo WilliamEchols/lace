@@ -23,18 +23,22 @@
 
 ;;; Commentary:
 
-;; LACE provides a seamless interface to interact with local AI models
-;; through Ollama directly within Emacs.
+;; LACE (Local AI Companion for Emacs) provides an interface to interact
+;; with local AI models directly in Emacs.
 ;;
 ;; Features:
 ;; - Real-time streaming chat interface
+;; - Automatic Ollama server management
 ;; - Support for multiple models
 ;; - Simple, distraction-free buffer
 ;; - Evil-mode compatibility
 ;;
-;; Usage:
+;; Basic Usage:
 ;; M-x lace-start-chat to begin a chat session
 ;; M-x lace-select-model to choose a different model
+;;
+;; For detailed documentation, customization options, and examples,
+;; see https://github.com/williamechols/lace
 
 ;;; Code:
 
@@ -52,6 +56,27 @@
 (defcustom lace-ollama-host "http://localhost:11434"
   "Host URL for ollama API."
   :type 'string
+  :group 'lace)
+
+(defcustom lace-ollama-executable "ollama"
+  "Path to the ollama executable."
+  :type 'string
+  :group 'lace)
+
+(defcustom lace-auto-start-server t
+  "Whether to automatically start the Ollama server when needed."
+  :type 'boolean
+  :group 'lace)
+
+(defcustom lace-max-context-size 1000000
+  "Maximum size in bytes for context files to prevent memory issues."
+  :type 'integer
+  :group 'lace)
+
+(defcustom lace-context-file-types
+  '(".el" ".js" ".py" ".cpp" ".hpp" ".c" ".h" ".java" ".go" ".rs" ".md" ".txt")
+  "File extensions to include when gathering directory context."
+  :type '(repeat string)
   :group 'lace)
 
 (defvar lace--current-model "qwen2.5:latest"
@@ -82,6 +107,33 @@
 
 (defvar-local lace--response-marker nil
   "Marker for where to insert streamed response.")
+
+(defvar lace--server-process nil
+  "Process object for the Ollama server.")
+
+(defvar lace--current-context nil
+  "Plist containing current context information.
+Structure: (:files [list of files] :content [concatenated content])")
+
+(defvar-local lace--buffer-context nil
+  "Context information specific to this chat buffer.")
+
+(defcustom lace-sidebar-width 60
+  "Width of the LACE sidebar chat window."
+  :type 'integer
+  :group 'lace)
+
+(defvar-local lace--suggestion-markers nil
+  "Markers for suggested code changes in the associated buffer.")
+
+(defvar lace-suggestion-delimiters '("<<<CODE>>>" "</CODE>>>")
+  "Delimiters for code suggestions in chat responses.")
+
+(defvar lace-suggestion-accept-key "C-c C-a"
+  "Keybinding to accept a code suggestion.")
+
+(defvar lace-suggestion-reject-key "C-c C-r"
+  "Keybinding to reject a code suggestion.")
 
 (defun lace--log (format-string &rest args)
   "Log a message to *Messages* with FORMAT-STRING and ARGS."
@@ -123,6 +175,7 @@
 (defun lace--make-api-call (endpoint data callback &optional method)
   "Make API call to Ollama ENDPOINT with DATA and process the result with CALLBACK.
 Optional METHOD defaults to POST."
+  (lace--ensure-server)
   (let* ((url-request-method (or method "POST"))
          (url-request-extra-headers '(("Content-Type" . "application/json")))
          (url-request-data (when data
@@ -190,7 +243,6 @@ Optional METHOD defaults to POST."
                          (if (plist-get status :error)
                              (progn
                                (lace--log "Error in URL retrieve: %S" (plist-get status :error))
-                               (lace--handle-stream-error (plist-get status :error)))
                            (if-let ((proc (get-buffer-process (current-buffer))))
                                (progn
                                  (lace--log "Got process: %S" proc)
@@ -198,17 +250,25 @@ Optional METHOD defaults to POST."
                                  (set-process-filter proc #'lace--stream-filter)
                                  (process-put proc 'response-buffer response-buffer))
                              (lace--log "Error: No process found for buffer"))))))
-      (error (lace--log "Error setting up stream: %S" err)))))
+      (error (lace--log "Error setting up stream: %S" err))))))
 
 (defun lace-send-message ()
   "Send the current line to the AI model."
   (interactive)
+  (lace--ensure-server)
   (let* ((message (buffer-substring-no-properties
                    (line-beginning-position)
                    (line-end-position)))
+         ;; Use buffer-local context if available, otherwise global
+         (context (or lace--buffer-context lace--current-context))
+         (context-str (when context
+                       (lace--format-context-prompt)))
+         (full-prompt (if context-str
+                         (concat "Context:\n" context-str "\n\nUser message: " message)
+                       message))
          (request-data (json-encode
                        `((model . ,lace--current-model)
-                         (prompt . ,message)
+                         (prompt . ,full-prompt)
                          (stream . t)))))
     
     ;; Insert newline after current line
@@ -221,7 +281,7 @@ Optional METHOD defaults to POST."
     (setq-local lace--response-marker (point-marker))
     
     ;; Debug output
-    (lace--log "Sending message: %s" message)
+    (lace--log "Sending message with context: %s" (if context-str "yes" "no"))
     
     ;; Make network request using open-network-stream
     (let* ((response-buffer (generate-new-buffer " *lace-response*"))
@@ -259,49 +319,48 @@ Optional METHOD defaults to POST."
 
 (defun lace--stream-filter (proc string)
   "Process streaming STRING from PROC."
-  ;; (lace--log "Received data: %S" string)
   (let ((chat-buffer (process-get proc 'chat-buffer)))
     (with-current-buffer (process-buffer proc)
       (goto-char (point-max))
       (insert string)
       
-      ;; Skip HTTP headers on first chunk
+      ;; Improved HTTP header handling
       (goto-char (point-min))
-      (when (looking-at "HTTP/.*\n\\(.\\|\n\\)*\n\n")
-        (lace--log "Skipping HTTP headers")
-        (delete-region (point-min) (match-end 0)))
+      (when (search-forward "\r\n\r\n" nil t)
+        (delete-region (point-min) (point))
+        (lace--log "Removed HTTP headers"))
       
-      ;; Process complete JSON objects
+      ;; Process complete JSON lines
       (goto-char (point-min))
-      (while (re-search-forward "^{.*}$" nil t)
-        (let* ((json-string (match-string 0))
+      (while (re-search-forward "^\\([^[:cntrl:]]+\\)\n" nil t)
+        (let* ((json-line (match-string 1))
                (json-object-type 'plist)
                (json-array-type 'list))
-          ;; (lace--log "Processing JSON: %s" json-string)
-          (condition-case err
-              (let* ((response (json-read-from-string json-string))
-                     (token (plist-get response :response))
-                     (done (plist-get response :done)))
-                (when token
-                  (lace--log "Inserting token: %S" token)
-                  (with-current-buffer chat-buffer
-                    (save-excursion
-                      (goto-char (marker-position lace--response-marker))
-                      (insert token)
-                      (set-marker lace--response-marker (point))
-                      (redisplay t))))  ; Force display update
-                ;; Only add "You: " prompt when done is true
-                (when (eq done t)  ; explicitly check for t
-                  (lace--log "Response complete")
-                  (with-current-buffer chat-buffer
-                    (save-excursion
-                      (goto-char (point-max))
-                      (insert "\n\nYou: ")))))
-            (error
-             (lace--log "Error processing JSON: %S" err)))))
-      
-      ;; Clear processed text
-      (delete-region (point-min) (point)))))
+          (delete-region (point-min) (point))
+          (unless (string-blank-p json-line)
+            (condition-case err
+                (let* ((response (json-read-from-string json-line))
+                       (token (plist-get response :response))
+                       (done (plist-get response :done)))
+                  (when token
+                    (with-current-buffer chat-buffer
+                      (save-excursion
+                        (goto-char (marker-position lace--response-marker))
+                        (insert token)
+                        (set-marker lace--response-marker (point))
+                        (redisplay t))))
+                  (when done
+                    (with-current-buffer chat-buffer
+                      (setq-local lace--awaiting-response nil)
+                      (unless (get-text-property (point-min) 'response-finalized)
+                        (lace--finalize-suggestion)
+                        (save-excursion
+                          (goto-char (point-max))
+                          (insert "\n\nYou: ")
+                          (put-text-property (point-min) (point-max) 
+                                           'response-finalized t))))))
+              (error 
+               (lace--log "Error processing JSON: %s" (error-message-string err))))))))))
 
 (defun lace--stream-sentinel (proc event)
   "Handle PROC EVENT for streaming."
@@ -314,8 +373,7 @@ Optional METHOD defaults to POST."
   "Format a chat message with ROLE and CONTENT."
   (propertize (format "%s: %s\n" 
                       (propertize (capitalize role) 'face 'bold)
-                      content)
-              'read-only t))
+              'read-only t)))
 
 (defun lace--insert-message (role content)
   "Insert a message with ROLE and CONTENT into the chat buffer."
@@ -399,19 +457,21 @@ Optional METHOD defaults to POST."
 (defun lace-select-model ()
   "Interactively select an Ollama model to use."
   (interactive)
+  (lace--ensure-server)
   (lace-list-models
    (lambda (response)
      (let* ((models (mapcar (lambda (model) (plist-get model :name))
-                            (plist-get response :models)))
-            (selected (completing-read "Select model: " models)))
+                           (plist-get response :models)))
        (setq lace--current-model selected)
-       (message "Selected model: %s" selected)))))
+       (message "Selected model: %s" selected))))))
 
 (defun lace-start-chat ()
   "Start a new chat session."
   (interactive)
+  (lace--ensure-server)
   (let ((buf (lace--setup-chat-buffer)))
     (switch-to-buffer buf)
+    (lace-chat-mode)
     (insert "You: ")
     (message "Chat started. Type your message and press RET to send.")))
 
@@ -483,6 +543,308 @@ Optional METHOD defaults to POST."
         (message "Ollama is running and accessible"))
     (error
      (message "Cannot connect to Ollama: %s" (error-message-string err)))))
+
+(defun lace--ensure-server ()
+  "Ensure the Ollama server is running, starting it if necessary and configured."
+  (unless (lace--server-running-p)
+    (if lace-auto-start-server
+        (lace-start-server)
+      (user-error "Ollama server is not running. Use M-x lace-start-server or start manually"))))
+
+(defun lace--server-running-p ()
+  "Check if the Ollama server is running."
+  (or (and lace--server-process
+           (process-live-p lace--server-process))
+      (condition-case nil
+          (progn
+            (let ((proc (open-network-stream
+                        "lace-test" nil
+                        "localhost" 11434
+                        :type 'plain
+                        :coding 'no-conversion)))
+              (delete-process proc)
+              t))
+        (error nil))))
+
+(defun lace-start-server ()
+  "Start the Ollama server process."
+  (interactive)
+  (if (lace--server-running-p)
+      (message "Ollama server is already running")
+    (let ((process-environment
+           ;; Ensure PATH is inherited for finding ollama executable
+           (cons (concat "PATH=" (getenv "PATH")) process-environment)))
+      (condition-case err
+          (progn
+            (setq lace--server-process
+                  (make-process
+                   :name "ollama-server"
+                   :buffer "*ollama-server*"
+                   :command (list lace-ollama-executable "serve")
+                   :sentinel #'lace--server-sentinel))
+            (message "Started Ollama server")
+            ;; Wait briefly to ensure server is ready
+            (sleep-for 1))
+        (error
+         (user-error "Failed to start Ollama server: %s" (error-message-string err)))))))
+
+(defun lace-stop-server ()
+  "Stop the Ollama server process."
+  (interactive)
+  (when (and lace--server-process
+             (process-live-p lace--server-process))
+    (delete-process lace--server-process)
+    (setq lace--server-process nil)
+    (message "Stopped Ollama server")))
+
+(defun lace--server-sentinel (process event)
+  "Monitor PROCESS for EVENT changes."
+  (when (memq (process-status process) '(exit signal))
+    (setq lace--server-process nil)
+    (message "Ollama server process ended: %s" (string-trim event))))
+
+(defun lace-set-file-context (file)
+  "Set FILE as the current context for AI suggestions."
+  (interactive "fSelect file for context: ")
+  (setq lace--current-context nil)
+  (setq lace--pending-changes nil)
+  (let ((content-list nil)
+        (total-size 0))
+    (when (and (file-readable-p file)
+               (not (file-directory-p file))
+               (let ((ext (file-name-extension file)))
+                 (member (concat "." ext) lace-context-file-types)))
+      (let ((size (file-attribute-size (file-attributes file))))
+        (when (< total-size lace-max-context-size)
+          (push (cons file (with-temp-buffer
+                           (insert-file-contents file)
+                           (buffer-string)))
+                content-list)
+          (setq total-size (+ total-size size)))))
+    (setq lace--current-context
+          `(:files ,(mapcar #'car content-list)
+            :content ,(mapcar #'cdr content-list)))
+    (message "Context set with %d files (%.2fMB)"
+             (length (plist-get lace--current-context :files))
+             (/ total-size 1024.0 1024.0))))
+
+(defun lace-set-directory-context (dir)
+  "Set all relevant files in DIR as context for AI suggestions."
+  (interactive "DDirectory: ")
+  (setq lace--current-context nil)
+  (setq lace--pending-changes nil)
+  (let ((files (directory-files-recursively
+                dir
+                (regexp-opt lace-context-file-types)))
+        (content-list nil)
+        (total-size 0))
+    (dolist (file files)
+      (when (and (file-readable-p file)
+                 (not (file-directory-p file)))
+        (let ((size (file-attribute-size (file-attributes file))))
+          (when (< (+ total-size size) lace-max-context-size)
+            (push (cons file (with-temp-buffer
+                             (insert-file-contents file)
+                             (buffer-string)))
+                  content-list)
+            (setq total-size (+ total-size size))))))
+    (setq lace--current-context
+          `(:files ,(mapcar #'car content-list)
+            :content ,(mapcar #'cdr content-list)))
+    (message "Context set with %d files (%.2fMB)"
+             (length (plist-get lace--current-context :files))
+             (/ total-size 1024.0 1024.0))))
+
+(defun lace-clear-context ()
+  "Clear the current context."
+  (interactive)
+  (setq lace--current-context nil)
+  (setq lace--pending-changes nil)
+  (message "Context cleared"))
+
+(defun lace--format-context-prompt ()
+  "Format the current context for inclusion in prompts."
+  (when lace--current-context
+    (let ((files (plist-get lace--current-context :files))
+          (contents (plist-get lace--current-context :content)))
+      (concat "IMPORTANT: When suggesting code changes, use this exact format:\n"
+              "FILE: <filename>\n"
+              "BEFORE:\n```\n<existing code>\n```\n"
+              "AFTER:\n```\n<modified code>\n```\n"
+              "Wrap all code blocks with " (car lace-suggestion-delimiters) " and " (cadr lace-suggestion-delimiters) "\n\n"
+              "Current file context:\n"
+              "----------------\n"
+              (mapconcat
+               (lambda (file-and-content)
+                 (format "=== %s ===\n%s\n"
+                         (file-relative-name (car file-and-content))
+                         (cdr file-and-content)))
+               (cl-mapcar #'cons files contents)
+               "\n")))))
+
+(defun lace-send-sidebar-message ()
+  "Send message in sidebar chat."
+  (interactive)
+  (let* ((message (buffer-substring-no-properties
+                   (line-beginning-position)
+                   (line-end-position)))
+         (context lace--buffer-context)
+         (context-str (when context
+                       (lace--format-context-prompt)))
+         (full-prompt (if context-str
+                         (concat "Context:\n" context-str "\n\nUser message: " message)
+                       message)))
+    (let ((lace--current-context context))
+      (lace-send-message))))
+
+(define-derived-mode lace-sidebar-mode lace-chat-mode "LACE Sidebar"
+  "Major mode for LACE sidebar chat interface."
+  (setq-local window-size-fixed 'width)
+  (setq-local lace--chat-buffer-name (buffer-name))
+  (setq-local lace--current-context lace--buffer-context)
+  (setq-local lace--suggestion-markers nil)
+  (define-key lace-sidebar-mode-map (kbd lace-suggestion-accept-key) #'lace-accept-suggestion)
+  (define-key lace-sidebar-mode-map (kbd lace-suggestion-reject-key) #'lace-reject-suggestion)
+  (define-key lace-sidebar-mode-map (kbd "RET") #'lace-send-sidebar-message)
+  (define-key lace-sidebar-mode-map (kbd "C-c C-c") #'lace-send-sidebar-message))
+
+(defun lace-toggle-sidebar ()
+  "Toggle the LACE sidebar chat for the current buffer."
+  (interactive)
+  (let* ((current-file (buffer-file-name))
+         (chat-buffer-name (format "*LACE Chat: %s*" 
+                                 (if current-file 
+                                     (file-name-nondirectory current-file)
+                                   (buffer-name))))
+         (chat-buffer (get-buffer chat-buffer-name)))
+    (if (and chat-buffer 
+             (get-buffer-window chat-buffer))
+        ;; If sidebar exists, close it
+        (delete-window (get-buffer-window chat-buffer))
+      ;; Create or show sidebar
+      (let ((chat-buffer (or chat-buffer 
+                            (generate-new-buffer chat-buffer-name))))
+        (with-current-buffer chat-buffer
+          (unless (eq major-mode 'lace-sidebar-mode)
+            (lace-sidebar-mode)
+            ;; Set context for this chat buffer
+            (let ((file-content (with-temp-buffer
+                                 (insert-file-contents current-file)
+                                 (buffer-string))))
+              (setq-local lace--buffer-context 
+                         (when current-file
+                           `(:files (,current-file)
+                             :content (,file-content)))))
+            (insert "You: ")))
+        ;; Display sidebar
+        (display-buffer-in-side-window
+         chat-buffer
+         `((side . right)
+           (window-width . ,lace-sidebar-width)))))))
+
+;; Add global key binding for toggling sidebar
+(global-set-key (kbd "C-c l s") #'lace-toggle-sidebar)
+
+(defun lace--detect-suggestion (chat-buffer)
+  "Detect code suggestions in CHAT-BUFFER and prepare for application."
+  (with-current-buffer chat-buffer
+    (save-excursion
+      (goto-char (point-min))
+      (when (re-search-forward 
+             (format "%s\\(.*?\\)%s" 
+                     (regexp-quote (car lace-suggestion-delimiters))
+                     (regexp-quote (cadr lace-suggestion-delimiters))) 
+             nil t)
+        (let ((start (match-beginning 1))
+              (end (match-end 1)))
+          (put-text-property start end 'face 'diff-added)
+          (put-text-property start end 'lace-suggestion t))))))
+
+(defun lace--finalize-suggestion ()
+  "Finalize suggestion detection and add action buttons."
+  (when (not (get-text-property (point-min) 'lace-suggestion-finalized))
+    (save-excursion
+      (goto-char (point-max))
+      (insert "\n\n")
+      (insert-button "Accept Change" 
+                     'action (lambda (_) (lace-accept-suggestion))
+                     'face 'button)
+      (insert " ")
+      (insert-button "Reject Change" 
+                     'action (lambda (_) (lace-reject-suggestion))
+                     'face 'button)
+      (put-text-property (point-min) (point-max) 'lace-suggestion-finalized t)
+      (setq-local lace--awaiting-response nil)
+      (lace--update-mode-line))))
+
+(defun lace-accept-suggestion ()
+  "Accept the current code suggestion and apply it to the original buffer."
+  (interactive)
+  (lace--log "Attempting to accept suggestion...")
+  (let* ((chat-buffer (current-buffer))
+         (suggestion (lace--extract-suggestion)))
+    (lace--log "Extracted suggestion: %S" suggestion)
+    (when suggestion
+      ;; Find the file mentioned in the suggestion
+      (save-excursion
+        (goto-char (point-min))
+        (when (re-search-forward "FILE:[ \t]*\\(.*?\\)[ \t]*[\n\r]" nil t)
+          (let* ((filename (match-string 1))
+                 (file-buffer (find-buffer-visiting filename))
+                 (content (car suggestion))
+                 (replacement (cdr suggestion)))
+            ;; If buffer not found, try to find the file relative to the project root
+            (unless file-buffer
+              (setq file-buffer 
+                    (find-file-noselect 
+                     (expand-file-name filename (project-root (project-current))))))
+            
+            (if file-buffer
+                (with-current-buffer file-buffer
+                  (save-excursion
+                    (goto-char (point-min))
+                    (let ((case-fold-search nil))
+                      (lace--log "Searching for content in %s: %S" filename content)
+                      (if (search-forward content nil t)
+                          (let ((start (match-beginning 0))
+                                (end (match-end 0)))
+                            (lace--log "Found match at %d-%d" start end)
+                            (delete-region start end)
+                            (insert replacement)
+                            (lace--log "Replacement complete")
+                            (message "Change accepted and applied successfully."))
+                        (lace--log "No matches found for suggestion in %s" filename)
+                        (message "Could not find the text to replace in %s" filename)))))
+              (message "Could not find or open file: %s" filename))))))))
+
+(defun lace-reject-suggestion ()
+  "Reject the current code suggestion."
+  (interactive)
+  (let ((inhibit-read-only t))
+    (delete-region (point-min) (point-max))
+    (message "Change rejected.")))
+
+(defun lace--extract-suggestion ()
+  "Extract code suggestion from chat buffer."
+  (save-excursion
+    (goto-char (point-min))
+    (let* ((header-regex "FILE:[ \t]*\\(.*?\\)[ \t]*[\n\r]+BEFORE:[ \t]*[\n\r]+")
+           (before-regex "```[^\n\r]*[\n\r]+\\([^`]*?\\)[\n\r]+```")
+           (after-regex "[\n\r]+AFTER:[ \t]*[\n\r]+```[^\n\r]*[\n\r]+\\([^`]*?\\)[\n\r]+```"))
+      (lace--log "=== Buffer Content ===")
+      (lace--log "%s" (buffer-substring-no-properties (point-min) (point-max)))
+      (lace--log "=== Matching Pattern ===")
+      (lace--log "Header: %s" header-regex)
+      (lace--log "Before: %s" before-regex)
+      (lace--log "After: %s" after-regex)
+      
+      ;; Try to match the structured format
+      (when (re-search-forward (concat header-regex before-regex after-regex) nil t)
+        (let ((file (match-string 1))
+              (before (string-trim (match-string 2)))
+              (after (string-trim (match-string 3))))
+          (lace--log "Match groups: [%s][%s][%s]" file before after)
+          (cons before after))))))
 
 (provide 'lace)
 
