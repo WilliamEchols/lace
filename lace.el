@@ -462,8 +462,9 @@ Optional METHOD defaults to POST."
    (lambda (response)
      (let* ((models (mapcar (lambda (model) (plist-get model :name))
                            (plist-get response :models)))
+            (selected (completing-read "Select model: " models)))
        (setq lace--current-model selected)
-       (message "Selected model: %s" selected))))))
+       (message "Selected model: %s" selected)))))
 
 (defun lace-start-chat ()
   "Start a new chat session."
@@ -769,7 +770,7 @@ Optional METHOD defaults to POST."
       (insert-button "Accept Change" 
                      'action (lambda (_) (lace-accept-suggestion))
                      'face 'button)
-      (insert " ")
+      (insert " | ")
       (insert-button "Reject Change" 
                      'action (lambda (_) (lace-reject-suggestion))
                      'face 'button)

@@ -13,10 +13,9 @@ LACE provides an interface to interact with local AI models directly in Emacs.
 - Real-time streaming chat interface with AI models
 - Automatic Ollama server management
 - Support for multiple Ollama models
-- Simple, distraction-free chat buffer
 - Evil-mode compatibility
-- Minimal dependencies (just built-in Emacs packages)
-- Context-aware code suggestions with accept/reject functionality
+- Minimal dependencies (just built-in Emacs packages and Ollama)
+- Context-aware change suggestions with accept/reject functionality
 - Sidebar chat interface for file-specific discussions
 
 ## Installation
@@ -128,6 +127,19 @@ Use `M-x customize-group RET lace RET` or add to your init file:
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
+
+## Known Issues
+
+- In the sidebar, after the first suggestion, the buttons show up and work fine. If I then send a following response, the buttons do not show up for this message and there is no "You: " in the buffer to indicate where to start the next response. I don't think we are properly handling multiple user messages in the same LACE Sidebar chat.
+- Need to update the context to include updated file content when using the sidebar. (If I accept a change or make my own changes, then I ask another question, the model does not have the updated file content.)
+- Only show Accept Change or Reject Change buttons if there are changes to accept or reject.
+- Are before, after, and <<<CODE>>> blocks all necessary? Would it be more reliable and easier to use an alternative structure?
+
+## Roadmap
+
+- Multiple file context in sidebar.
+- Make the suggestion interface more robust.
+- Visualize diff in original buffer when accepting/rejecting changes.
 
 ## License
 
